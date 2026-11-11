@@ -1,9 +1,7 @@
 /*
- * memscope - a small Linux memory inspector
+ * memscope - a simple Linux memory inspector
  *
  * Modes:
- *   memscope                   interactive menu (variables, arrays, pointers,
- *                              "where does this address live?", alloc demo)
  *   memscope map <pid>         memory map of a process, with per-type totals
  *   memscope watch <pid> [s]   re-read every s seconds, show what changed
  *
@@ -14,7 +12,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -419,285 +416,6 @@ static int cmd_watch(const char *pid, unsigned interval)
 }
 
 /* ------------------------------------------------------------------ */
-/* Interactive menu                                                    */
-/* ------------------------------------------------------------------ */
-
-typedef struct {
-    int a;
-    double b;
-    char c;
-    int *arr;
-    int n;
-} Demo;
-
-static int global_counter = 42;   /* a global, to see where globals live */
-
-static const Region *region_containing(const Snapshot *s, unsigned long addr)
-{
-    for (size_t i = 0; i < s->count; i++)
-        if (addr >= s->items[i].start && addr < s->items[i].end)
-            return &s->items[i];
-    return NULL;
-}
-
-static void inspect_variables(const Demo *d)
-{
-    puts("\n--- VARIABLE INSPECTION ---");
-
-    printf("Integer value: %d\n", d->a);
-    printf("Size: %zu bytes\n", sizeof(d->a));
-    printf("Address: %p\n", (const void *)&d->a);
-
-    printf("\nDouble value: %.4f\n", d->b);
-    printf("Size: %zu bytes\n", sizeof(d->b));
-    printf("Address: %p\n", (const void *)&d->b);
-
-    printf("\nCharacter value: %c\n", d->c);
-    printf("Size: %zu bytes\n", sizeof(d->c));
-    printf("Address: %p\n", (const void *)&d->c);
-}
-
-static void inspect_array(const Demo *d)
-{
-    puts("\n--- ARRAY MEMORY INSPECTION ---");
-    printf("Array base address: %p\n", (const void *)d->arr);
-    printf("Total allocated size: %zu bytes\n", (size_t)d->n * sizeof(int));
-
-    for (int i = 0; i < d->n; i++)
-        printf("Index: %d | Value: %d | Address: %p\n",
-               i, d->arr[i], (const void *)&d->arr[i]);
-}
-
-static void inspect_pointer(const Demo *d)
-{
-    puts("\n--- POINTER INSPECTION ---");
-
-    const int *ptr = d->arr;
-
-    printf("Pointer's own address: %p\n", (const void *)&ptr);
-    printf("Address stored in pointer: %p\n", (const void *)ptr);
-    printf("Value at pointed address: %d\n", *ptr);
-
-    for (int i = 0; i < d->n; i++)
-        printf("Index: %d | Address: %p | Dereferenced value: %d\n",
-               i, (const void *)(ptr + i), *(ptr + i));
-}
-
-/* returns 0 on bad input that should end the program */
-static int modify_memory(Demo *d)
-{
-    int index, num;
-
-    puts("\n--- MEMORY MODIFICATION ---");
-    printf("Enter the index (0 to %d): ", d->n - 1);
-    if (scanf("%d", &index) != 1) {
-        puts("Invalid index input.");
-        return 0;
-    }
-    if (index < 0 || index >= d->n) {
-        puts("Invalid index.");
-        return 1;
-    }
-
-    printf("Enter the new value: ");
-    if (scanf("%d", &num) != 1) {
-        puts("Invalid value.");
-        return 0;
-    }
-
-    printf("Original value: %d\n", d->arr[index]);
-
-    int *ptr = &d->arr[index];
-    *ptr = num;
-
-    printf("Modified value through pointer: %d\n", *ptr);
-    printf("Updated array element: %d\n", d->arr[index]);
-    printf("Element address: %p\n", (void *)ptr);
-    return 1;
-}
-
-/* Ask the OS: which memory region does each of these addresses live in? */
-static void locate_addresses(Demo *d)
-{
-    puts("\n--- WHERE DOES EACH ADDRESS LIVE? ---");
-
-    Snapshot s = {0};
-    if (!read_smaps_file("/proc/self/smaps", &s)) {
-        perror("read /proc/self/smaps");
-        return;
-    }
-
-    const char *literal = "a string literal";
-    int *local_ptr = d->arr;
-
-    struct { const char *label; unsigned long addr; } items[] = {
-        { "local int a",            (unsigned long)(uintptr_t)&d->a },
-        { "local double b",         (unsigned long)(uintptr_t)&d->b },
-        { "pointer variable",       (unsigned long)(uintptr_t)&local_ptr },
-        { "calloc'd array (arr)",   (unsigned long)(uintptr_t)d->arr },
-        { "global variable",        (unsigned long)(uintptr_t)&global_counter },
-        { "string literal",         (unsigned long)(uintptr_t)literal },
-        { "our own code (function)",(unsigned long)(uintptr_t)&locate_addresses },
-        { "libc code (printf)",     (unsigned long)(uintptr_t)&printf },
-    };
-
-    printf("%-24s %-16s %-8s %-6s %s\n",
-           "WHAT", "ADDRESS", "TYPE", "PERMS", "REGION PATH");
-    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
-        const Region *r = region_containing(&s, items[i].addr);
-        printf("%-24s %-16lx %-8s %-6s %s\n",
-               items[i].label, items[i].addr,
-               r ? classify(r) : "?",
-               r ? r->perms : "?",
-               r ? r->path : "(not found)");
-    }
-
-    puts("\nNote: a small calloc/malloc lands in [heap], but big requests "
-         "(about 128 kB+)\nare served by mmap and show up as ANON instead.");
-    snap_free(&s);
-}
-
-/* Allocate memory and watch RSS react: untouched memory costs nothing. */
-static void alloc_demo(void)
-{
-    int mb;
-    puts("\n--- ALLOCATION DEMO ---");
-    printf("How many MB to allocate (1-1024)? ");
-    if (scanf("%d", &mb) != 1 || mb < 1 || mb > 1024) {
-        puts("Invalid size.");
-        return;
-    }
-
-    Snapshot before = {0}, mid = {0}, after = {0};
-    if (!read_smaps_file("/proc/self/smaps", &before)) {
-        perror("read /proc/self/smaps");
-        return;
-    }
-
-    size_t bytes = (size_t)mb * 1024 * 1024;
-    volatile char *p = malloc(bytes);
-    if (!p) {
-        puts("Memory allocation failed.");
-        snap_free(&before);
-        return;
-    }
-
-    read_smaps_file("/proc/self/smaps", &mid);
-    printf("\n1) After malloc(%d MB), before writing anything:\n", mb);
-    show_changes(&before, &mid);
-
-    for (size_t i = 0; i < bytes; i += 4096)   /* touch one byte per page */
-        p[i] = 1;
-
-    read_smaps_file("/proc/self/smaps", &after);
-    printf("\n2) After writing to every page:\n");
-    show_changes(&mid, &after);
-
-    free((void *)p);
-    snap_free(&before);
-    snap_free(&mid);
-    snap_free(&after);
-}
-
-static int run_menu(void)
-{
-    Demo d = {0};
-
-    puts("ENTER THE INTEGER");
-    if (scanf("%d", &d.a) != 1) {
-        puts("Invalid integer.");
-        return 1;
-    }
-
-    puts("ENTER THE DOUBLE");
-    if (scanf("%lf", &d.b) != 1) {
-        puts("Invalid double.");
-        return 1;
-    }
-
-    puts("ENTER THE CHARACTER");
-    if (scanf(" %c", &d.c) != 1) {
-        puts("Invalid character.");
-        return 1;
-    }
-
-    puts("ENTER THE SIZE OF ARRAY");
-    if (scanf("%d", &d.n) != 1 || d.n <= 0) {
-        puts("INVALID ARRAY SIZE");
-        return 1;
-    }
-
-    d.arr = calloc((size_t)d.n, sizeof(int));
-    if (!d.arr) {
-        puts("Memory allocation failed.");
-        return 1;
-    }
-
-    puts("Enter the array elements:");
-    for (int i = 0; i < d.n; i++) {
-        printf("arr[%d]: ", i);
-        if (scanf("%d", &d.arr[i]) != 1) {
-            puts("Invalid input.");
-            free(d.arr);
-            return 1;
-        }
-    }
-
-    for (;;) {
-        int choice;
-
-        puts("\n========== MEMSCOPE ==========");
-        puts("[1] Variable Inspection");
-        puts("[2] Array Memory Inspection");
-        puts("[3] Pointer Inspection");
-        puts("[4] Memory Modification");
-        puts("[5] Where does each address live? (stack/heap/code)");
-        puts("[6] Full memory map of this program");
-        puts("[7] Allocation demo (watch RSS change)");
-        puts("[0] Exit");
-        printf("Enter your choice: ");
-
-        if (scanf("%d", &choice) != 1) {
-            puts("Invalid input.");
-            break;
-        }
-
-        if (choice == 0) {
-            puts("Exiting MemScope.");
-            break;
-        }
-
-        switch (choice) {
-        case 1: inspect_variables(&d); break;
-        case 2: inspect_array(&d);     break;
-        case 3: inspect_pointer(&d);   break;
-        case 4:
-            if (!modify_memory(&d)) {
-                free(d.arr);
-                return 1;
-            }
-            break;
-        case 5: locate_addresses(&d);  break;
-        case 6: {
-            Snapshot s = {0};
-            if (read_smaps_file("/proc/self/smaps", &s)) {
-                print_snapshot(&s);
-                snap_free(&s);
-            } else {
-                perror("read /proc/self/smaps");
-            }
-            break;
-        }
-        case 7: alloc_demo();          break;
-        default: puts("Invalid choice. Select 0 to 7."); break;
-        }
-    }
-
-    free(d.arr);
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -705,19 +423,15 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage:\n"
-            "  %s                      interactive menu\n"
             "  %s map <pid>            memory map of a process\n"
             "  %s watch <pid> [secs]   show memory changes every secs (default 2)\n"
             "<pid> may also be the word \"self\".\n",
-            prog, prog, prog);
+            prog, prog);
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc == 1)
-        return run_menu();
-
-    if (strcmp(argv[1], "map") == 0 && argc == 3) {
+    if (argc == 3 && strcmp(argv[1], "map") == 0{
         if (!is_valid_pid(argv[2])) {
             fprintf(stderr, "PID must be a number\n");
             return 1;
@@ -725,7 +439,8 @@ int main(int argc, char *argv[])
         return cmd_map(argv[2]);
     }
 
-    if (strcmp(argv[1], "watch") == 0 && (argc == 3 || argc == 4)) {
+    if (argc >= 2 && strcmp(argv[1], "watch") == 0 &&
+        (argc == 3 || argc == 4)) {
         if (!is_valid_pid(argv[2])) {
             fprintf(stderr, "PID must be a number\n");
             return 1;
